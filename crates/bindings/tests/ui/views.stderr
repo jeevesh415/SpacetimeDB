@@ -296,8 +296,8 @@ note: required by a bound in `ViewRegistrar::<AnonymousViewContext>::register`
 error[E0277]: the trait bound `NotSpacetimeType: SpacetimeType` is not satisfied
    --> tests/ui/views.rs:130:71
     |
-130 | fn view_def_returns_not_a_spacetime_type(_: &AnonymousViewContext) -> Option<NotSpacetimeType> {
-    |                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+130 | ...ViewContext) -> Option<NotSpacetimeType> {
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
     |
 help: the trait `SpacetimeType` is not implemented for `NotSpacetimeType`
    --> tests/ui/views.rs:66:1
@@ -320,8 +320,8 @@ help: the trait `SpacetimeType` is not implemented for `NotSpacetimeType`
 error[E0277]: the trait bound `NotSpacetimeType: Serialize` is not satisfied
    --> tests/ui/views.rs:130:71
     |
-130 | fn view_def_returns_not_a_spacetime_type(_: &AnonymousViewContext) -> Option<NotSpacetimeType> {
-    |                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+130 | ...ViewContext) -> Option<NotSpacetimeType> {
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
     |
 help: the trait `Serialize` is not implemented for `NotSpacetimeType`
    --> tests/ui/views.rs:66:1
@@ -355,7 +355,7 @@ error[E0277]: invalid anonymous view signature
 note: required by a bound in `ViewDispatcher::<AnonymousViewContext>::invoke`
    --> src/rt.rs
     |
-    |     pub fn invoke<'a, A, T, V>(view: V, ctx: AnonymousViewContext, args: &'a [u8]) -> Vec<u8>
+    |     pub fn invoke<'a, A, T, V>(view: V, ctx: AnonymousViewContext, args: &'a [u8]) ...
     |            ------ required by a bound in this associated function
 ...
     |         V: AnonymousView<'a, A, T>,
@@ -365,8 +365,8 @@ note: required by a bound in `ViewDispatcher::<AnonymousViewContext>::invoke`
 error[E0277]: the trait bound `NotSpacetimeType: SpacetimeType` is not satisfied
    --> tests/ui/views.rs:130:71
     |
-130 | fn view_def_returns_not_a_spacetime_type(_: &AnonymousViewContext) -> Option<NotSpacetimeType> {
-    |                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+130 | ...ViewContext) -> Option<NotSpacetimeType> {
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
     |
 help: the trait `SpacetimeType` is not implemented for `NotSpacetimeType`
    --> tests/ui/views.rs:66:1
