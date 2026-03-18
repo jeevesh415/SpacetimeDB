@@ -14,6 +14,7 @@ use spacetimedb_execution::pipelined::ViewProject;
 use spacetimedb_execution::{pipelined::PipelinedProject, Datastore, DeltaStore};
 use spacetimedb_lib::identity::AuthCtx;
 use spacetimedb_lib::{metrics::ExecutionMetrics, Identity};
+use spacetimedb_metrics::metrics_enabled;
 use spacetimedb_primitives::TableId;
 use spacetimedb_sats::bsatn::ToBsatn;
 use spacetimedb_sats::Serialize;
@@ -62,6 +63,9 @@ impl ExecutionCounters {
 
     /// Update the global system metrics with transaction-level execution metrics.
     pub(crate) fn record(&self, metrics: &ExecutionMetrics) {
+        if !metrics_enabled() {
+            return;
+        }
         if metrics.index_seeks > 0 {
             self.rdb_num_index_seeks.inc_by(metrics.index_seeks as u64);
         }

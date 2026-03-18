@@ -43,6 +43,7 @@ use spacetimedb_client_api_messages::energy::FunctionBudget;
 use spacetimedb_client_api_messages::websocket::common::{ByteListLen as _, RowListLen as _};
 use spacetimedb_client_api_messages::websocket::v1::{self as ws_v1};
 use spacetimedb_client_api_messages::websocket::v2::{self as ws_v2};
+use spacetimedb_metrics::metrics_enabled;
 use spacetimedb_data_structures::error_stream::ErrorStream;
 use spacetimedb_data_structures::map::{HashCollectionExt as _, HashSet};
 use spacetimedb_datastore::error::DatastoreError;
@@ -766,6 +767,9 @@ struct CreateInstanceTimeMetric {
 
 impl Drop for CreateInstanceTimeMetric {
     fn drop(&mut self) {
+        if !metrics_enabled() {
+            return;
+        }
         let _ = WORKER_METRICS
             .module_create_instance_time_seconds
             .remove_label_values(&self.database_identity, &self.host_type);
@@ -774,6 +778,9 @@ impl Drop for CreateInstanceTimeMetric {
 
 impl CreateInstanceTimeMetric {
     fn observe(&self, duration: std::time::Duration) {
+        if !metrics_enabled() {
+            return;
+        }
         self.metric.observe(duration.as_secs_f64());
     }
 }
@@ -1113,29 +1120,44 @@ impl ModuleHost {
         })
     }
 
-    fn start_call_timer(&self, label: &str) -> ScopeGuard<(), impl FnOnce(()) + use<>> {
-        // Record the time until our function starts running.
-        let queue_timer = WORKER_METRICS
-            .reducer_wait_time
-            .with_label_values(&self.info.database_identity, label)
-            .start_timer();
-        let queue_length_gauge = WORKER_METRICS
-            .instance_queue_length
-            .with_label_values(&self.info.database_identity);
-        queue_length_gauge.inc();
-        {
-            let queue_length = queue_length_gauge.get();
-            WORKER_METRICS
-                .instance_queue_length_histogram
-                .with_label_values(&self.info.database_identity)
-                .observe(queue_length as f64);
-        }
+    fn start_call_timer(
+        &self,
+        label: &str,
+    ) -> ScopeGuard<
+        (Option<IntGauge>, Option<prometheus::HistogramTimer>),
+        impl FnOnce((Option<IntGauge>, Option<prometheus::HistogramTimer>)) + use<>,
+    > {
+        let (queue_length_gauge, queue_timer) = if metrics_enabled() {
+            // Record the time until our function starts running.
+            let queue_timer = WORKER_METRICS
+                .reducer_wait_time
+                .with_label_values(&self.info.database_identity, label)
+                .start_timer();
+            let queue_length_gauge = WORKER_METRICS
+                .instance_queue_length
+                .with_label_values(&self.info.database_identity);
+            queue_length_gauge.inc();
+            {
+                let queue_length = queue_length_gauge.get();
+                WORKER_METRICS
+                    .instance_queue_length_histogram
+                    .with_label_values(&self.info.database_identity)
+                    .observe(queue_length as f64);
+            }
+            (Some(queue_length_gauge), Some(queue_timer))
+        } else {
+            (None, None)
+        };
         // Ensure that we always decrement the gauge.
-        scopeguard::guard((), move |_| {
+        scopeguard::guard((queue_length_gauge, queue_timer), |(queue_length_gauge, queue_timer)| {
             // Decrement the queue length gauge when we're done.
             // This is done in a defer so that it happens even if the reducer call panics.
-            queue_length_gauge.dec();
-            queue_timer.stop_and_record();
+            if let Some(queue_length_gauge) = queue_length_gauge {
+                queue_length_gauge.dec();
+            }
+            if let Some(queue_timer) = queue_timer {
+                queue_timer.stop_and_record();
+            }
         })
     }
 

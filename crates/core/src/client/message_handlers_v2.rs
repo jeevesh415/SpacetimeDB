@@ -6,6 +6,7 @@ use serde::de::Error as _;
 use spacetimedb_client_api_messages::websocket::v2 as ws_v2;
 use spacetimedb_datastore::execution_context::WorkloadType;
 use spacetimedb_lib::{bsatn, Timestamp};
+use spacetimedb_metrics::metrics_enabled;
 use spacetimedb_primitives::ReducerId;
 use spacetimedb_sats::raw_identifier::RawIdentifier;
 use std::time::Instant;
@@ -38,16 +39,20 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
     let res: HandleResult<'_> = match message {
         ws_v2::ClientMessage::Subscribe(subscribe) => {
             let res = client.subscribe_v2(subscribe, timer).await.map(sub_metrics);
-            mod_metrics
-                .request_round_trip_subscribe
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                mod_metrics
+                    .request_round_trip_subscribe
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             res.map_err(|e| (None, None, e.into()))
         }
         ws_v2::ClientMessage::Unsubscribe(unsubscribe) => {
             let res = client.unsubscribe_v2(unsubscribe, timer).await.map(unsub_metrics);
-            mod_metrics
-                .request_round_trip_unsubscribe
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                mod_metrics
+                    .request_round_trip_unsubscribe
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             res.map_err(|e| (None, None, e.into()))
         }
         ws_v2::ClientMessage::OneOffQuery(ws_v2::OneOffQuery {
@@ -55,9 +60,11 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
             query_string,
         }) => {
             let res = client.one_off_query_v2(&query_string, request_id, timer).await;
-            mod_metrics
-                .request_round_trip_sql
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                mod_metrics
+                    .request_round_trip_sql
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             res.map_err(|err| (None, None, err))
         }
         ws_v2::ClientMessage::CallReducer(ws_v2::CallReducer {
@@ -67,10 +74,12 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
             flags,
         }) => {
             let res = client.call_reducer_v2(reducer, args, request_id, timer, flags).await;
-            WORKER_METRICS
-                .request_round_trip
-                .with_label_values(&WorkloadType::Reducer, &database_identity, reducer)
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                WORKER_METRICS
+                    .request_round_trip
+                    .with_label_values(&WorkloadType::Reducer, &database_identity, reducer)
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             match res {
                 Ok(_) => {
                     // If this was not a success, we would have already sent an error message.
@@ -101,10 +110,12 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
             let res = client
                 .call_procedure_v2(procedure, args, request_id, timer, flags)
                 .await;
-            WORKER_METRICS
-                .request_round_trip
-                .with_label_values(&WorkloadType::Procedure, &database_identity, procedure)
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                WORKER_METRICS
+                    .request_round_trip
+                    .with_label_values(&WorkloadType::Procedure, &database_identity, procedure)
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             if let Err(e) = res {
                 log::warn!("Procedure call failed: {e:#}");
             }

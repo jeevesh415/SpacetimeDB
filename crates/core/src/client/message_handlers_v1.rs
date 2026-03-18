@@ -10,6 +10,7 @@ use spacetimedb_datastore::execution_context::WorkloadType;
 use spacetimedb_lib::de::serde::DeserializeWrapper;
 use spacetimedb_lib::identity::RequestId;
 use spacetimedb_lib::{bsatn, ConnectionId, Timestamp};
+use spacetimedb_metrics::metrics_enabled;
 use spacetimedb_sats::raw_identifier::RawIdentifier;
 use spacetimedb_schema::identifier::Identifier;
 use spacetimedb_schema::reducer_name::ReducerName;
@@ -60,10 +61,12 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
             flags,
         }) => {
             let res = client.call_reducer(reducer, args, request_id, timer, flags).await;
-            WORKER_METRICS
-                .request_round_trip
-                .with_label_values(&WorkloadType::Reducer, &database_identity, reducer)
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                WORKER_METRICS
+                    .request_round_trip
+                    .with_label_values(&WorkloadType::Reducer, &database_identity, reducer)
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             res.map(drop).map_err(|e| {
                 (
                     Some(reducer),
@@ -74,37 +77,47 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
         }
         ws_v1::ClientMessage::SubscribeMulti(subscription) => {
             let res = client.subscribe_multi(subscription, timer).await.map(sub_metrics);
-            mod_metrics
-                .request_round_trip_subscribe
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                mod_metrics
+                    .request_round_trip_subscribe
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             res.map_err(|e| (None, None, e.into()))
         }
         ws_v1::ClientMessage::UnsubscribeMulti(request) => {
             let res = client.unsubscribe_multi(request, timer).await.map(unsub_metrics);
-            mod_metrics
-                .request_round_trip_unsubscribe
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                mod_metrics
+                    .request_round_trip_unsubscribe
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             res.map_err(|e| (None, None, e.into()))
         }
         ws_v1::ClientMessage::SubscribeSingle(subscription) => {
             let res = client.subscribe_single(subscription, timer).await.map(sub_metrics);
-            mod_metrics
-                .request_round_trip_subscribe
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                mod_metrics
+                    .request_round_trip_subscribe
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             res.map_err(|e| (None, None, e.into()))
         }
         ws_v1::ClientMessage::Unsubscribe(request) => {
             let res = client.unsubscribe(request, timer).await.map(unsub_metrics);
-            mod_metrics
-                .request_round_trip_unsubscribe
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                mod_metrics
+                    .request_round_trip_unsubscribe
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             res.map_err(|e| (None, None, e.into()))
         }
         ws_v1::ClientMessage::Subscribe(subscription) => {
             let res = client.subscribe(subscription, timer).await.map(Some).map(sub_metrics);
-            mod_metrics
-                .request_round_trip_subscribe
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                mod_metrics
+                    .request_round_trip_subscribe
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             res.map_err(|e| (None, None, e.into()))
         }
         ws_v1::ClientMessage::OneOffQuery(ws_v1::OneOffQuery {
@@ -115,9 +128,11 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
                 Protocol::Binary => client.one_off_query_bsatn(&query, &message_id, timer).await,
                 Protocol::Text => client.one_off_query_json(&query, &message_id, timer).await,
             };
-            mod_metrics
-                .request_round_trip_sql
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                mod_metrics
+                    .request_round_trip_sql
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             res.map_err(|err| (None, None, err))
         }
         ws_v1::ClientMessage::CallProcedure(ws_v1::CallProcedure {
@@ -127,10 +142,12 @@ pub async fn handle(client: &ClientConnection, message: DataMessage, timer: Inst
             flags: _,
         }) => {
             let res = client.call_procedure(procedure, args, request_id, timer).await;
-            WORKER_METRICS
-                .request_round_trip
-                .with_label_values(&WorkloadType::Procedure, &database_identity, procedure)
-                .observe(timer.elapsed().as_secs_f64());
+            if metrics_enabled() {
+                WORKER_METRICS
+                    .request_round_trip
+                    .with_label_values(&WorkloadType::Procedure, &database_identity, procedure)
+                    .observe(timer.elapsed().as_secs_f64());
+            }
             if let Err(e) = res {
                 log::warn!("Procedure call failed: {e:#}");
             }

@@ -23,6 +23,7 @@ use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use durability::{Durability, EmptyHistory};
 use log::{info, trace, warn};
+use spacetimedb_metrics::metrics_enabled;
 use parking_lot::Mutex;
 use scopeguard::defer;
 use spacetimedb_commitlog::SizeOnDisk;
@@ -1096,7 +1097,11 @@ impl Host {
         module_host.clear_all_clients().await?;
 
         scheduler_starter.start(&module_host)?;
-        let disk_metrics_recorder_task = tokio::spawn(metric_reporter(replica_ctx.clone())).abort_handle();
+        let disk_metrics_recorder_task = if metrics_enabled() {
+            tokio::spawn(metric_reporter(replica_ctx.clone())).abort_handle()
+        } else {
+            tokio::spawn(async {}).abort_handle()
+        };
         let view_cleanup_task = spawn_view_cleanup_loop(replica_ctx.relational_db.clone());
 
         let module = watch::Sender::new(module_host);

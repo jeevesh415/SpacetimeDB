@@ -40,6 +40,7 @@ use spacetimedb_client_api_messages::websocket::v1 as ws_v1;
 use spacetimedb_client_api_messages::websocket::v2 as ws_v2;
 use spacetimedb_datastore::execution_context::WorkloadType;
 use spacetimedb_lib::connection_id::{ConnectionId, ConnectionIdForUrl};
+use spacetimedb_metrics::metrics_enabled;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
@@ -1510,19 +1511,23 @@ impl ClientMessage {
 
 struct SendMetrics {
     database: Identity,
-    encode_timing: Histogram,
+    encode_timing: Option<Histogram>,
 }
 
 impl SendMetrics {
     fn new(database: Identity) -> Self {
         Self {
-            encode_timing: WORKER_METRICS.websocket_serialize_secs.with_label_values(&database),
+            encode_timing: metrics_enabled()
+                .then(|| WORKER_METRICS.websocket_serialize_secs.with_label_values(&database)),
             database,
         }
     }
 
     fn report(&self, workload: Option<WorkloadType>, num_rows: Option<usize>, encode: EncodeMetrics) {
-        self.encode_timing.observe(encode.timing.as_secs_f64());
+        let Some(encode_timing) = &self.encode_timing else {
+            return;
+        };
+        encode_timing.observe(encode.timing.as_secs_f64());
 
         // These metrics should be updated together,
         // or not at all.

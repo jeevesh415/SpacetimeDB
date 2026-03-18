@@ -45,6 +45,7 @@ use spacetimedb_lib::de::DeserializeSeed;
 use spacetimedb_lib::identity::AuthCtx;
 use spacetimedb_lib::metrics::ExecutionMetrics;
 use spacetimedb_lib::{bsatn, ConnectionId, Hash, ProductType, RawModuleDef, Timestamp};
+use spacetimedb_metrics::metrics_enabled;
 use spacetimedb_primitives::{ProcedureId, TableId, ViewFnPtr, ViewId};
 use spacetimedb_sats::algebraic_type::fmt::fmt_algebraic_type;
 use spacetimedb_sats::{AlgebraicType, AlgebraicTypeRef, Deserialize, ProductValue, Typespace, WithTypespace};
@@ -866,9 +867,8 @@ impl InstanceCommon {
         let reducer_def = info.module_def.reducer_by_id(reducer_id);
         let reducer_name = &reducer_def.name;
 
-        // Do some `with_label_values`.
-        // TODO(perf, centril): consider caching this.
-        let _outer_span = start_call_function_span(reducer_name, &caller_identity, caller_connection_id_opt);
+        let _outer_span =
+            metrics_enabled().then(|| start_call_function_span(reducer_name, &caller_identity, caller_connection_id_opt));
 
         let op = ReducerOp {
             id: reducer_id,
@@ -883,15 +883,18 @@ impl InstanceCommon {
         let tx = tx.unwrap_or_else(|| stdb.begin_mut_tx(IsolationLevel::Serializable, workload));
         let mut tx_slot = inst.tx_slot();
 
-        let vm_metrics = self.vm_metrics.get_for_reducer_id(reducer_id);
-        let _guard = vm_metrics.timer_guard_for_reducer_plus_query(tx.timer);
+        let vm_metrics = metrics_enabled().then(|| self.vm_metrics.get_for_reducer_id(reducer_id));
+        let _guard = vm_metrics
+            .as_ref()
+            .map(|vm_metrics| vm_metrics.timer_guard_for_reducer_plus_query(tx.timer));
 
         let (mut tx, result) = tx_slot.set(tx, || {
             self.call_function(caller_identity, reducer_name, |budget| inst.call_reducer(op, budget))
         });
 
-        // Report execution metrics on each reducer call.
-        vm_metrics.report(&result.stats);
+        if let Some(vm_metrics) = &vm_metrics {
+            vm_metrics.report(&result.stats);
+        }
 
         // An outer error occurred.
         // This signifies a logic error in the module rather than a properly
@@ -952,10 +955,11 @@ impl InstanceCommon {
             (ViewCallResult::default(tx), trapped)
         };
 
-        // Account for view execution in reducer reporting metrics
-        vm_metrics.report_energy_used(out.energy_used);
-        vm_metrics.report_total_duration(out.total_duration);
-        vm_metrics.report_abi_duration(out.abi_duration);
+        if let Some(vm_metrics) = &vm_metrics {
+            vm_metrics.report_energy_used(out.energy_used);
+            vm_metrics.report_total_duration(out.total_duration);
+            vm_metrics.report_abi_duration(out.abi_duration);
+        }
 
         let status = match out.outcome {
             ViewOutcome::BudgetExceeded => EventStatus::OutOfEnergy,

@@ -38,6 +38,7 @@ use spacetimedb_lib::bsatn::ToBsatn;
 use spacetimedb_lib::db::auth::StAccess;
 use spacetimedb_lib::db::raw_def::v9::{btree, RawModuleDefV9Builder, RawSql};
 use spacetimedb_lib::st_var::StVarValue;
+use spacetimedb_metrics::metrics_enabled;
 use spacetimedb_lib::ConnectionId;
 use spacetimedb_lib::Identity;
 use spacetimedb_paths::server::{ReplicaDir, SnapshotsPath};
@@ -1021,6 +1022,9 @@ impl RelationalDB {
         metrics_for_writer: Option<TxMetrics>,
         metrics_for_reader: Option<TxMetrics>,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         if let Some(recorder) = &self.metrics_recorder_queue {
             recorder.send_metrics(
                 reducer,

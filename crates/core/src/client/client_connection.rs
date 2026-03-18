@@ -23,6 +23,7 @@ use crate::util::prometheus_handle::IntGaugeExt;
 use crate::worker_metrics::WORKER_METRICS;
 use bytes::Bytes;
 use bytestring::ByteString;
+use spacetimedb_metrics::metrics_enabled;
 use derive_more::From;
 use futures::prelude::*;
 use prometheus::{Histogram, IntCounter, IntGauge};
@@ -726,22 +727,29 @@ impl ClientConnection {
         let abort_handle = tokio::spawn(async move {
             let Ok(fut) = fut_rx.await else { return };
 
-            let _gauge_guard = module_info.metrics.connected_clients.inc_scope();
-            module_info.metrics.ws_clients_spawned.inc();
+            let _gauge_guard = metrics_enabled().then(|| module_info.metrics.connected_clients.inc_scope());
+            if metrics_enabled() {
+                module_info.metrics.ws_clients_spawned.inc();
+            }
             scopeguard::defer! {
-                let database_identity = module_info.database_identity;
-                log::warn!("websocket connection aborted for client identity `{client_identity}` and database identity `{database_identity}`");
-                module_info.metrics.ws_clients_aborted.inc();
+                if metrics_enabled() {
+                    let database_identity = module_info.database_identity;
+                    log::warn!("websocket connection aborted for client identity `{client_identity}` and database identity `{database_identity}`");
+                    module_info.metrics.ws_clients_aborted.inc();
+                }
             };
 
             fut.await
         })
         .abort_handle();
 
-        let metrics = ClientConnectionMetrics::new(database_identity, config.protocol);
+        let metrics = metrics_enabled().then(|| ClientConnectionMetrics::new(database_identity, config.protocol));
         let receiver = ClientConnectionReceiver::new(
             config.confirmed_reads,
-            MeteredReceiver::with_gauge(sendrx, metrics.sendtx_queue_size.clone()),
+            match &metrics {
+                Some(metrics) => MeteredReceiver::with_gauge(sendrx, metrics.sendtx_queue_size.clone()),
+                None => MeteredReceiver::new(sendrx),
+            },
             module_rx.clone(),
         );
 
@@ -752,7 +760,7 @@ impl ClientConnection {
             sendtx,
             abort_handle,
             cancelled: AtomicBool::new(false),
-            metrics: Some(metrics),
+            metrics,
         });
         let this = Self {
             sender,

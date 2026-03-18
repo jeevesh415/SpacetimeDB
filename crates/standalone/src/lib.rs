@@ -29,6 +29,7 @@ use spacetimedb_client_api_messages::name::{
 use spacetimedb_datastore::db_metrics::data_size::DATA_SIZE_METRICS;
 use spacetimedb_datastore::db_metrics::DB_METRICS;
 use spacetimedb_datastore::traits::Program;
+use spacetimedb_metrics::metrics_enabled;
 use spacetimedb_paths::server::{ModuleLogsDir, PidFile, ServerDataDir};
 use spacetimedb_paths::standalone::StandaloneDataDirExt;
 use spacetimedb_schema::auto_migrate::{MigrationPolicy, PrettyPrintStyle};
@@ -89,9 +90,11 @@ impl StandaloneEnv {
         let auth_env = auth::default_auth_environment(jwt_keys, LOCALHOST.into());
 
         let metrics_registry = prometheus::Registry::new();
-        metrics_registry.register(Box::new(&*WORKER_METRICS)).unwrap();
-        metrics_registry.register(Box::new(&*DB_METRICS)).unwrap();
-        metrics_registry.register(Box::new(&*DATA_SIZE_METRICS)).unwrap();
+        if metrics_enabled() {
+            metrics_registry.register(Box::new(&*WORKER_METRICS)).unwrap();
+            metrics_registry.register(Box::new(&*DB_METRICS)).unwrap();
+            metrics_registry.register(Box::new(&*DATA_SIZE_METRICS)).unwrap();
+        }
 
         Ok(Arc::new(Self {
             control_db,
@@ -155,6 +158,9 @@ impl NodeDelegate for StandaloneEnv {
     type GetLeaderHostError = GetLeaderHostError;
 
     fn gather_metrics(&self) -> Vec<prometheus::proto::MetricFamily> {
+        if !metrics_enabled() {
+            return Vec::new();
+        }
         self.metrics_registry.gather()
     }
 
