@@ -33,7 +33,6 @@ use crate::subscription::module_subscription_manager::TransactionOffset;
 use crate::util::jobs::{AllocatedJobCore, CorePinner, LoadBalanceOnDropGuard};
 use core::any::type_name;
 use core::str;
-use enum_as_inner::EnumAsInner;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use itertools::Either;
@@ -290,52 +289,32 @@ impl JsInstanceEnv {
 /// The actual work happens in a worker thread,
 /// which the instance communicates with through channels.
 ///
-/// When the instance is dropped, the channels will hang up,
-/// which will cause the worker's loop to terminate
-/// and cleanup the isolate and friends.
+/// This handle is cloneable and shared by callers. Requests are queued FIFO
+/// on the worker thread so the next reducer can start immediately after the
+/// previous one finishes, without waiting for an outer task to hand the
+/// instance back.
+///
+/// When the last handle is dropped, the channels will hang up,
+/// which will cause the worker's loop to terminate and cleanup the isolate
+/// and friends.
+#[derive(Clone)]
 pub struct JsInstance {
     request_tx: flume::Sender<JsWorkerRequest>,
-    reply_rx: flume::Receiver<(JsWorkerReply, bool)>,
-    trapped: bool,
 }
 
 impl JsInstance {
-    pub fn trapped(&self) -> bool {
-        self.trapped
-    }
-
-    /// Send a request to the worker and wait for a reply.
-    async fn send_recv<T>(
-        &mut self,
-        extract: impl FnOnce(JsWorkerReply) -> Result<T, JsWorkerReply>,
-        request: JsWorkerRequest,
-    ) -> T {
-        // Send the request.
+    async fn send_request<T>(&self, request: impl FnOnce(oneshot::Sender<T>) -> JsWorkerRequest) -> T {
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
-            .send_async(request)
+            .send_async(request(reply_tx))
             .await
-            .expect("worker's `request_rx` should be live as `JsInstance::drop` hasn't happened");
-
-        // Wait for the response.
-        let (reply, trapped) = self
-            .reply_rx
-            .recv_async()
+            .expect("worker `request_rx` should be live while `JsInstance` handles exist");
+        reply_rx
             .await
-            .expect("worker's `reply_tx` should be live as `JsInstance::drop` hasn't happened");
-
-        self.trapped = trapped;
-
-        match extract(reply) {
-            Err(err) => unreachable!("should have received {} but got {err:?}", type_name::<T>()),
-            Ok(reply) => reply,
-        }
+            .unwrap_or_else(|_| panic!("worker should reply to {}", type_name::<T>()))
     }
 
-    /// Run the given function on the worker thread.
-    ///
-    /// This method, unlike the others, does not expect a response on the
-    /// `reply_rx` channel, since the return value `R` could be of any type.
-    pub async fn run_on_thread<F, R>(&mut self, f: F) -> R
+    pub async fn run_on_thread<F, R>(&self, f: F) -> R
     where
         F: AsyncFnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -343,20 +322,18 @@ impl JsInstance {
         let span = tracing::Span::current();
         let (tx, rx) = oneshot::channel();
 
-        let request = JsWorkerRequest::RunFunction(Box::new(move || {
-            async move {
-                let result = AssertUnwindSafe(f().instrument(span)).catch_unwind().await;
-                if let Err(Err(_panic)) = tx.send(result) {
-                    tracing::warn!("uncaught panic on `SingleCoreExecutor`")
-                }
-            }
-            .boxed_local()
-        }));
-
         self.request_tx
-            .send_async(request)
+            .send_async(JsWorkerRequest::RunFunction(Box::new(move || {
+                async move {
+                    let result = AssertUnwindSafe(f().instrument(span)).catch_unwind().await;
+                    if let Err(Err(_panic)) = tx.send(result) {
+                        tracing::warn!("uncaught panic on `SingleCoreExecutor`")
+                    }
+                }
+                .boxed_local()
+            })))
             .await
-            .expect("worker's `request_rx` should be live as `JsInstance::drop` hasn't happened");
+            .expect("worker `request_rx` should be live while `JsInstance` handles exist");
 
         match rx.await.unwrap() {
             Ok(r) => r,
@@ -365,157 +342,136 @@ impl JsInstance {
     }
 
     pub async fn update_database(
-        &mut self,
+        &self,
         program: Program,
         old_module_info: Arc<ModuleInfo>,
         policy: MigrationPolicy,
     ) -> anyhow::Result<UpdateDatabaseResult> {
-        self.send_recv(
-            JsWorkerReply::into_update_database,
-            JsWorkerRequest::UpdateDatabase {
-                program,
-                old_module_info,
-                policy,
-            },
-        )
+        self.send_request(|reply_tx| JsWorkerRequest::UpdateDatabase {
+            reply_tx,
+            program,
+            old_module_info,
+            policy,
+        })
         .await
     }
 
-    pub async fn call_reducer(&mut self, params: CallReducerParams) -> ReducerCallResult {
-        self.send_recv(
-            JsWorkerReply::into_call_reducer,
-            JsWorkerRequest::CallReducer { params },
-        )
-        .await
-    }
-
-    pub async fn clear_all_clients(&mut self) -> anyhow::Result<()> {
-        self.send_recv(JsWorkerReply::into_clear_all_clients, JsWorkerRequest::ClearAllClients)
+    pub async fn call_reducer(&self, params: CallReducerParams) -> ReducerCallResult {
+        self.send_request(|reply_tx| JsWorkerRequest::CallReducer { reply_tx, params })
             .await
     }
 
+    pub async fn clear_all_clients(&self) -> anyhow::Result<()> {
+        self.send_request(JsWorkerRequest::ClearAllClients).await
+    }
+
     pub async fn call_identity_connected(
-        &mut self,
+        &self,
         caller_auth: ConnectionAuthCtx,
         caller_connection_id: ConnectionId,
     ) -> Result<(), ClientConnectedError> {
-        self.send_recv(
-            JsWorkerReply::into_call_identity_connected,
-            JsWorkerRequest::CallIdentityConnected(caller_auth, caller_connection_id),
-        )
+        self.send_request(|reply_tx| JsWorkerRequest::CallIdentityConnected {
+            reply_tx,
+            caller_auth,
+            caller_connection_id,
+        })
         .await
     }
 
     pub async fn call_identity_disconnected(
-        &mut self,
+        &self,
         caller_identity: Identity,
         caller_connection_id: ConnectionId,
     ) -> Result<(), ReducerCallError> {
-        self.send_recv(
-            JsWorkerReply::into_call_identity_disconnected,
-            JsWorkerRequest::CallIdentityDisconnected(caller_identity, caller_connection_id),
-        )
+        self.send_request(|reply_tx| JsWorkerRequest::CallIdentityDisconnected {
+            reply_tx,
+            caller_identity,
+            caller_connection_id,
+        })
         .await
     }
 
-    pub async fn disconnect_client(&mut self, client_id: ClientActorId) -> Result<(), ReducerCallError> {
-        self.send_recv(
-            JsWorkerReply::into_disconnect_client,
-            JsWorkerRequest::DisconnectClient(client_id),
-        )
-        .await
-    }
-
-    pub async fn init_database(&mut self, program: Program) -> anyhow::Result<Option<ReducerCallResult>> {
-        *self
-            .send_recv(
-                JsWorkerReply::into_init_database,
-                JsWorkerRequest::InitDatabase(program),
-            )
+    pub async fn disconnect_client(&self, client_id: ClientActorId) -> Result<(), ReducerCallError> {
+        self.send_request(|reply_tx| JsWorkerRequest::DisconnectClient { reply_tx, client_id })
             .await
     }
 
-    pub async fn call_procedure(&mut self, params: CallProcedureParams) -> CallProcedureReturn {
-        *self
-            .send_recv(
-                JsWorkerReply::into_call_procedure,
-                JsWorkerRequest::CallProcedure { params },
-            )
+    pub async fn init_database(&self, program: Program) -> anyhow::Result<Option<ReducerCallResult>> {
+        self.send_request(|reply_tx| JsWorkerRequest::InitDatabase { reply_tx, program })
             .await
     }
 
-    pub async fn call_view(&mut self, cmd: ViewCommand) -> ViewCommandResult {
-        *self
-            .send_recv(JsWorkerReply::into_call_view, JsWorkerRequest::CallView { cmd })
+    pub async fn call_procedure(&self, params: CallProcedureParams) -> CallProcedureReturn {
+        self.send_request(|reply_tx| JsWorkerRequest::CallProcedure { reply_tx, params })
+            .await
+    }
+
+    pub async fn call_view(&self, cmd: ViewCommand) -> ViewCommandResult {
+        self.send_request(|reply_tx| JsWorkerRequest::CallView { reply_tx, cmd })
             .await
     }
 
     pub(in crate::host) async fn call_scheduled_function(
-        &mut self,
+        &self,
         params: ScheduledFunctionParams,
     ) -> CallScheduledFunctionResult {
-        self.send_recv(
-            JsWorkerReply::into_call_scheduled_function,
-            JsWorkerRequest::CallScheduledFunction(params),
-        )
-        .await
+        self.send_request(|reply_tx| JsWorkerRequest::CallScheduledFunction { reply_tx, params })
+            .await
     }
 }
 
-/// A reply from the worker in [`spawn_instance_worker`].
-#[derive(EnumAsInner, Debug)]
-enum JsWorkerReply {
-    UpdateDatabase(anyhow::Result<UpdateDatabaseResult>),
-    CallReducer(ReducerCallResult),
-    CallView(Box<ViewCommandResult>),
-    CallProcedure(Box<CallProcedureReturn>),
-    ClearAllClients(anyhow::Result<()>),
-    CallIdentityConnected(Result<(), ClientConnectedError>),
-    CallIdentityDisconnected(Result<(), ReducerCallError>),
-    DisconnectClient(Result<(), ReducerCallError>),
-    InitDatabase(Box<anyhow::Result<Option<ReducerCallResult>>>),
-    CallScheduledFunction(CallScheduledFunctionResult),
-}
-
-static_assert_size!(JsWorkerReply, 48);
-
-/// A request for the worker in [`spawn_instance_worker`].
-// We care about optimizing for `CallReducer` as it happens frequently,
-// so we don't want to box anything in it.
 enum JsWorkerRequest {
-    /// See [`JsInstance::run_on_thread`].
-    ///
-    /// This variant does not expect a [`JsWorkerReply`].
     RunFunction(Box<dyn FnOnce() -> LocalBoxFuture<'static, ()> + Send>),
-    /// See [`JsInstance::update_database`].
     UpdateDatabase {
+        reply_tx: oneshot::Sender<anyhow::Result<UpdateDatabaseResult>>,
         program: Program,
         old_module_info: Arc<ModuleInfo>,
         policy: MigrationPolicy,
     },
-    /// See [`JsInstance::call_reducer`].
-    CallReducer { params: CallReducerParams },
-    /// See [`JsInstance::call_view`].
-    CallView { cmd: ViewCommand },
-    /// See [`JsInstance::call_procedure`].
-    CallProcedure { params: CallProcedureParams },
-    /// See [`JsInstance::clear_all_clients`].
-    ClearAllClients,
-    /// See [`JsInstance::call_identity_connected`].
-    CallIdentityConnected(ConnectionAuthCtx, ConnectionId),
-    /// See [`JsInstance::call_identity_disconnected`].
-    CallIdentityDisconnected(Identity, ConnectionId),
-    /// See [`JsInstance::disconnect_client`].
-    DisconnectClient(ClientActorId),
-    /// See [`JsInstance::init_database`].
-    InitDatabase(Program),
-    /// See [`JsInstance::call_scheduled_function`].
-    CallScheduledFunction(ScheduledFunctionParams),
+    CallReducer {
+        reply_tx: oneshot::Sender<ReducerCallResult>,
+        params: CallReducerParams,
+    },
+    CallView {
+        reply_tx: oneshot::Sender<ViewCommandResult>,
+        cmd: ViewCommand,
+    },
+    CallProcedure {
+        reply_tx: oneshot::Sender<CallProcedureReturn>,
+        params: CallProcedureParams,
+    },
+    ClearAllClients(oneshot::Sender<anyhow::Result<()>>),
+    CallIdentityConnected {
+        reply_tx: oneshot::Sender<Result<(), ClientConnectedError>>,
+        caller_auth: ConnectionAuthCtx,
+        caller_connection_id: ConnectionId,
+    },
+    CallIdentityDisconnected {
+        reply_tx: oneshot::Sender<Result<(), ReducerCallError>>,
+        caller_identity: Identity,
+        caller_connection_id: ConnectionId,
+    },
+    DisconnectClient {
+        reply_tx: oneshot::Sender<Result<(), ReducerCallError>>,
+        client_id: ClientActorId,
+    },
+    InitDatabase {
+        reply_tx: oneshot::Sender<anyhow::Result<Option<ReducerCallResult>>>,
+        program: Program,
+    },
+    CallScheduledFunction {
+        reply_tx: oneshot::Sender<CallScheduledFunctionResult>,
+        params: ScheduledFunctionParams,
+    },
 }
 
-// These two should be the same size (once core pinning PR lands).
-static_assert_size!(JsWorkerRequest, 192);
 static_assert_size!(CallReducerParams, 192);
+
+fn send_worker_reply<T>(ctx: &str, reply_tx: oneshot::Sender<T>, value: T) {
+    if reply_tx.send(value).is_err() {
+        log::error!("should have receiver for `{ctx}` response");
+    }
+}
 
 /// Performs some of the startup work of [`spawn_instance_worker`].
 ///
@@ -575,13 +531,10 @@ async fn spawn_instance_worker(
     load_balance_guard: Arc<LoadBalanceOnDropGuard>,
     mut core_pinner: CorePinner,
 ) -> anyhow::Result<(ModuleCommon, JsInstance)> {
-    // Spawn channels for bidirectional communication between worker and instance.
-    // The use-case is SPSC and all channels are rendezvous channels
-    // where each `.send` blocks until it's received.
-    // The Instance --Request-> Worker channel:
-    let (request_tx, request_rx) = flume::bounded(0);
-    // The Worker --Reply-> Instance channel:
-    let (reply_tx, reply_rx) = flume::bounded(0);
+    // Spawn a FIFO queue for requests to the worker.
+    // Multiple callers can enqueue concurrently, but the worker processes
+    // requests strictly one at a time on its dedicated thread.
+    let (request_tx, request_rx) = flume::unbounded();
 
     // This one-shot channel is used for initial startup error handling within the thread.
     let (result_tx, result_rx) = oneshot::channel();
@@ -659,65 +612,74 @@ async fn spawn_instance_worker(
 
         // Process requests to the worker.
         //
-        // The loop is terminated when a `JsInstance` is dropped.
+        // The loop is terminated when the last `JsInstance` handle is dropped.
         // This will cause channels, scopes, and the isolate to be cleaned up.
-        let reply = |ctx: &str, reply: JsWorkerReply, trapped| {
-            if let Err(e) = reply_tx.send((reply, trapped)) {
-                // This should never happen as `JsInstance::$function` immediately
-                // does `.recv` on the other end of the channel, though sometimes
-                // it gets cancelled.
-                log::error!("should have receiver for `{ctx}` response, {e}");
-            }
-        };
         for request in request_rx.iter() {
             let mut call_reducer = |tx, params| instance_common.call_reducer_with_tx(tx, params, &mut inst);
 
             core_pinner.pin_if_changed();
 
-            use JsWorkerReply::*;
             match request {
                 JsWorkerRequest::RunFunction(f) => rt.block_on(f()),
                 JsWorkerRequest::UpdateDatabase {
+                    reply_tx,
                     program,
                     old_module_info,
                     policy,
                 } => {
-                    // Update the database and reply to `JsInstance::update_database`.
                     let res = instance_common.update_database(program, old_module_info, policy, &mut inst);
-                    reply("update_database", UpdateDatabase(res), false);
+                    send_worker_reply("update_database", reply_tx, res);
                 }
-                JsWorkerRequest::CallReducer { params } => {
-                    // Call the reducer.
-                    // If execution trapped, we don't end the loop here,
-                    // but rather let this happen by `return_instance` using `JsInstance::trapped`
-                    // which will cause `JsInstance` to be dropped,
-                    // which in turn results in the loop being terminated.
+                JsWorkerRequest::CallReducer { reply_tx, params } => {
                     let (res, trapped) = call_reducer(None, params);
-                    reply("call_reducer", CallReducer(res), trapped);
+                    if trapped {
+                        log::warn!(
+                            "JS instance trapped while using queued single-instance execution; continuing to reuse the worker"
+                        );
+                    }
+                    send_worker_reply("call_reducer", reply_tx, res);
                 }
-                JsWorkerRequest::CallView { cmd } => {
+                JsWorkerRequest::CallView { reply_tx, cmd } => {
                     let (res, trapped) = instance_common.handle_cmd(cmd, &mut inst);
-                    reply("call_view", JsWorkerReply::CallView(res.into()), trapped);
+                    if trapped {
+                        log::warn!("JS instance trapped while handling a view; continuing to reuse the worker");
+                    }
+                    send_worker_reply("call_view", reply_tx, res);
                 }
-                JsWorkerRequest::CallProcedure { params } => {
+                JsWorkerRequest::CallProcedure { reply_tx, params } => {
                     let (res, trapped) = instance_common
                         .call_procedure(params, &mut inst)
                         .now_or_never()
                         .expect("our call_procedure implementation is not actually async");
-
-                    reply("call_procedure", JsWorkerReply::CallProcedure(res.into()), trapped);
+                    if trapped {
+                        log::warn!("JS instance trapped while handling a procedure; continuing to reuse the worker");
+                    }
+                    send_worker_reply("call_procedure", reply_tx, res);
                 }
-                JsWorkerRequest::ClearAllClients => {
+                JsWorkerRequest::ClearAllClients(reply_tx) => {
                     let res = instance_common.clear_all_clients();
-                    reply("clear_all_clients", ClearAllClients(res), false);
+                    send_worker_reply("clear_all_clients", reply_tx, res);
                 }
-                JsWorkerRequest::CallIdentityConnected(caller_auth, caller_connection_id) => {
+                JsWorkerRequest::CallIdentityConnected {
+                    reply_tx,
+                    caller_auth,
+                    caller_connection_id,
+                } => {
                     let mut trapped = false;
                     let res =
                         call_identity_connected(caller_auth, caller_connection_id, info, call_reducer, &mut trapped);
-                    reply("call_identity_connected", CallIdentityConnected(res), trapped);
+                    if trapped {
+                        log::warn!(
+                            "JS instance trapped while handling `client_connected`; continuing to reuse the worker"
+                        );
+                    }
+                    send_worker_reply("call_identity_connected", reply_tx, res);
                 }
-                JsWorkerRequest::CallIdentityDisconnected(caller_identity, caller_connection_id) => {
+                JsWorkerRequest::CallIdentityDisconnected {
+                    reply_tx,
+                    caller_identity,
+                    caller_connection_id,
+                } => {
                     let mut trapped = false;
                     let res = ModuleHost::call_identity_disconnected_inner(
                         caller_identity,
@@ -726,24 +688,40 @@ async fn spawn_instance_worker(
                         call_reducer,
                         &mut trapped,
                     );
-                    reply("call_identity_disconnected", CallIdentityDisconnected(res), trapped);
+                    if trapped {
+                        log::warn!(
+                            "JS instance trapped while handling `client_disconnected`; continuing to reuse the worker"
+                        );
+                    }
+                    send_worker_reply("call_identity_disconnected", reply_tx, res);
                 }
-                JsWorkerRequest::DisconnectClient(client_id) => {
+                JsWorkerRequest::DisconnectClient { reply_tx, client_id } => {
                     let mut trapped = false;
                     let res = ModuleHost::disconnect_client_inner(client_id, info, call_reducer, &mut trapped);
-                    reply("disconnect_client", DisconnectClient(res), trapped);
+                    if trapped {
+                        log::warn!("JS instance trapped while disconnecting a client; continuing to reuse the worker");
+                    }
+                    send_worker_reply("disconnect_client", reply_tx, res);
                 }
-                JsWorkerRequest::InitDatabase(program) => {
+                JsWorkerRequest::InitDatabase { reply_tx, program } => {
                     let (res, trapped): (Result<Option<ReducerCallResult>, anyhow::Error>, bool) =
                         init_database(replica_ctx, &module_common.info().module_def, program, call_reducer);
-                    reply("init_database", InitDatabase(Box::new(res)), trapped);
+                    if trapped {
+                        log::warn!("JS instance trapped while initializing a database; continuing to reuse the worker");
+                    }
+                    send_worker_reply("init_database", reply_tx, res);
                 }
-                JsWorkerRequest::CallScheduledFunction(params) => {
+                JsWorkerRequest::CallScheduledFunction { reply_tx, params } => {
                     let (res, trapped) = instance_common
                         .call_scheduled_function(params, &mut inst)
                         .now_or_never()
                         .expect("our call_procedure implementation is not actually async");
-                    reply("call_scheduled_function", CallScheduledFunction(res), trapped);
+                    if trapped {
+                        log::warn!(
+                            "JS instance trapped while handling a scheduled function; continuing to reuse the worker"
+                        );
+                    }
+                    send_worker_reply("call_scheduled_function", reply_tx, res);
                 }
             }
         }
@@ -752,11 +730,7 @@ async fn spawn_instance_worker(
     // Get the module, if any, and get any setup errors from the worker.
     let res: Result<ModuleCommon, anyhow::Error> = result_rx.await.expect("should have a sender");
     res.map(|opt_mc| {
-        let inst = JsInstance {
-            request_tx,
-            reply_rx,
-            trapped: false,
-        };
+        let inst = JsInstance { request_tx };
         (opt_mc, inst)
     })
 }

@@ -359,7 +359,8 @@ struct WasmtimeModuleHost {
 }
 
 struct V8ModuleHost {
-    instance_manager: ModuleInstanceManager<super::v8::JsModule>,
+    module: super::v8::JsModule,
+    instance: super::v8::JsInstance,
 }
 
 /// A module; used as a bound on `InstanceManager`.
@@ -407,7 +408,7 @@ impl GenericModule for super::v8::JsModule {
 
 impl GenericModuleInstance for super::v8::JsInstance {
     fn trapped(&self) -> bool {
-        self.trapped()
+        false
     }
 }
 
@@ -1064,8 +1065,10 @@ impl ModuleHost {
             }
             ModuleWithInstance::Js { module, init_inst } => {
                 info = module.info();
-                let instance_manager = ModuleInstanceManager::new(module, init_inst, database_identity);
-                Arc::new(ModuleHostInner::Js(V8ModuleHost { instance_manager }))
+                Arc::new(ModuleHostInner::Js(V8ModuleHost {
+                    module,
+                    instance: init_inst,
+                }))
             }
         };
         let on_panic = Arc::new(on_panic);
@@ -1133,16 +1136,11 @@ impl ModuleHost {
                     })
                     .await
             }
-            ModuleHostInner::Js(V8ModuleHost { instance_manager }) => {
-                instance_manager
-                    .with_instance(async |mut inst| {
-                        let res = inst
-                            .run_on_thread(async move || {
-                                drop(timer_guard);
-                                f().await
-                            })
-                            .await;
-                        (res, inst)
+            ModuleHostInner::Js(V8ModuleHost { instance, .. }) => {
+                instance
+                    .run_on_thread(async move || {
+                        drop(timer_guard);
+                        f().await
                     })
                     .await
             }
@@ -1201,7 +1199,7 @@ impl ModuleHost {
         arg: A,
         timer: impl FnOnce(&str) -> Guard,
         work_wasm: impl AsyncFnOnce(Guard, &SingleCoreExecutor, Box<ModuleInstance>, A) -> (R, Box<ModuleInstance>),
-        work_js: impl AsyncFnOnce(Guard, &mut JsInstance, A) -> R,
+        work_js: impl AsyncFnOnce(Guard, &JsInstance, A) -> R,
     ) -> Result<R, NoSuchModule> {
         self.guard_closed()?;
         let timer_guard = timer(label);
@@ -1228,11 +1226,7 @@ impl ModuleHost {
                     .with_instance(async |inst| work_wasm(timer_guard, executor, inst, arg).await)
                     .await
             }
-            ModuleHostInner::Js(V8ModuleHost { instance_manager }) => {
-                instance_manager
-                    .with_instance(async |mut inst| (work_js(timer_guard, &mut inst, arg).await, inst))
-                    .await
-            }
+            ModuleHostInner::Js(V8ModuleHost { instance, .. }) => work_js(timer_guard, instance, arg).await,
         })
     }
 
@@ -1245,7 +1239,7 @@ impl ModuleHost {
         label: &str,
         arg: A,
         wasm: impl AsyncFnOnce(A, &mut ModuleInstance) -> R + Send + 'static,
-        js: impl AsyncFnOnce(A, &mut JsInstance) -> R,
+        js: impl AsyncFnOnce(A, &JsInstance) -> R,
     ) -> Result<R, NoSuchModule>
     where
         R: Send + 'static,
@@ -2470,14 +2464,14 @@ impl ModuleHost {
     pub(crate) fn replica_ctx(&self) -> &ReplicaContext {
         match &*self.inner {
             ModuleHostInner::Wasm(wasm) => wasm.instance_manager.module.replica_ctx(),
-            ModuleHostInner::Js(js) => js.instance_manager.module.replica_ctx(),
+            ModuleHostInner::Js(js) => js.module.replica_ctx(),
         }
     }
 
     fn scheduler(&self) -> &Scheduler {
         match &*self.inner {
             ModuleHostInner::Wasm(wasm) => wasm.instance_manager.module.scheduler(),
-            ModuleHostInner::Js(js) => js.instance_manager.module.scheduler(),
+            ModuleHostInner::Js(js) => js.module.scheduler(),
         }
     }
 }
