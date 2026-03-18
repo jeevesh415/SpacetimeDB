@@ -827,7 +827,9 @@ impl<M: GenericModule> ModuleInstanceManager<M> {
     }
 
     async fn get_instance(&self) -> M::Instance {
-        let inst = self.instances.lock().await.pop_back();
+        // Prefer the most recently returned idle instance to improve cache locality
+        // and avoid bouncing sequential calls across multiple worker threads.
+        let inst = self.instances.lock().await.pop_front();
         if let Some(inst) = inst {
             inst
         } else {
