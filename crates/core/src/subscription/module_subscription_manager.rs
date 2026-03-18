@@ -704,6 +704,10 @@ impl SubscriptionManager {
         self.queries.get(hash).map(|state| state.query.clone())
     }
 
+    pub fn has_queries(&self) -> bool {
+        !self.queries.is_empty()
+    }
+
     pub fn calculate_gauge_stats(&self) -> SubscriptionGaugeStats {
         let num_queries = self.queries.len();
         let num_connections = self.clients.len();

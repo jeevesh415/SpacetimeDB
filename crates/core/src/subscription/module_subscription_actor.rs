@@ -373,6 +373,47 @@ impl ModuleSubscriptions {
         );
     }
 
+    fn send_reducer_success_without_subscriptions(
+        &self,
+        client: Arc<ClientConnectionSender>,
+        event: &Arc<ModuleEvent>,
+        tx_offset: TxOffset,
+    ) {
+        match client.config.version {
+            WsVersion::V1 => {
+                let message = TransactionUpdateMessage {
+                    event: Some(event.clone()),
+                    database_update: SubscriptionUpdateMessage::default_for_protocol(
+                        client.config.protocol,
+                        event.request_id,
+                    ),
+                };
+                let _ = self
+                    .broadcast_queue
+                    .send_client_message_v1(client, Some(from_tx_offset(tx_offset)), message);
+            }
+            WsVersion::V2 => {
+                let Some(request_id) = event.request_id else {
+                    tracing::warn!("missing request_id for v2 reducer success without subscriptions");
+                    return;
+                };
+                let message = ws_v2::ReducerResult {
+                    request_id,
+                    timestamp: event.timestamp,
+                    result: ws_v2::ReducerOutcome::Ok(ws_v2::ReducerOk {
+                        ret_value: event.reducer_return_value.clone().unwrap_or_default(),
+                        transaction_update: ws_v2::TransactionUpdate {
+                            query_sets: Vec::new().into_boxed_slice(),
+                        },
+                    }),
+                };
+                let _ = self
+                    .broadcast_queue
+                    .send_client_message_v2(client, Some(from_tx_offset(tx_offset)), message);
+            }
+        }
+    }
+
     /// Construct a new [`ModuleSubscriptions`] for use in testing,
     /// creating a new [`tokio::runtime::Runtime`] to run its send worker.
     pub fn for_test_new_runtime(db: Arc<RelationalDB>) -> (ModuleSubscriptions, tokio::runtime::Runtime) {
@@ -1598,6 +1639,48 @@ impl ModuleSubscriptions {
         tx: MutTx,
     ) -> Result<CommitAndBroadcastEventResult, DBError> {
         let subscription_metrics = &self.metrics.update;
+        let stdb = &self.relational_db;
+
+        if matches!(
+            event.status,
+            EventStatus::FailedUser(_) | EventStatus::FailedInternal(_) | EventStatus::OutOfEnergy
+        ) {
+            // If the transaction failed, we need to rollback the mutable tx.
+            // We don't need to do any subscription updates in this case, so we will exit early.
+            let event = Arc::new(event);
+            let tx_offset = Self::rollback_mut_tx(stdb, tx);
+            if let Some(client) = caller {
+                match client.config.version {
+                    WsVersion::V1 => {
+                        let message = TransactionUpdateMessage {
+                            event: Some(event.clone()),
+                            database_update: SubscriptionUpdateMessage::default_for_protocol(
+                                client.config.protocol,
+                                None,
+                            ),
+                        };
+
+                        let _ = self.broadcast_queue.send_client_message_v1(
+                            client,
+                            Some(from_tx_offset(tx_offset)),
+                            message,
+                        );
+                    }
+                    WsVersion::V2 => {
+                        if let Some(request_id) = event.request_id {
+                            self.send_reducer_failure_result_v2(client, &event, request_id);
+                        }
+                    }
+                }
+            } else {
+                log::trace!("Reducer failed but there is no client to send the failure to!")
+            }
+            return Ok(Ok(CommitAndBroadcastEventSuccess {
+                tx_offset: from_tx_offset(tx_offset),
+                event,
+                metrics: ExecutionMetrics::default(),
+            }));
+        }
 
         // Take a read lock on `subscriptions` before committing tx
         // else it can result in subscriber receiving duplicate updates.
@@ -1608,53 +1691,44 @@ impl ModuleSubscriptions {
             self.subscriptions.read()
         };
 
-        let stdb = &self.relational_db;
-        // Downgrade mutable tx.
-        // We'll later ensure tx is released/cleaned up once out of scope.
-        let (read_tx, tx_data, tx_metrics_mut) = match &mut event.status {
-            EventStatus::Committed(db_update) => {
+        if !subscriptions.has_queries() {
+            // Keep a downgraded read lock alive until we've enqueued the caller response.
+            // `commit_tx` would release the committed-state lock before durability is queued,
+            // which allows the next writer to overtake this transaction in the commitlog.
+            let (tx_data, tx_metrics_mut, read_tx) = if let EventStatus::Committed(db_update) = &mut event.status {
                 let (tx_data, tx_metrics, read_tx) = stdb.commit_tx_downgrade(tx, Workload::Update);
                 *db_update = DatabaseUpdate::from_writes(&tx_data);
-                (read_tx, tx_data, tx_metrics)
-            }
-            EventStatus::FailedUser(_) | EventStatus::FailedInternal(_) | EventStatus::OutOfEnergy => {
-                // If the transaction failed, we need to rollback the mutable tx.
-                // We don't need to do any subscription updates in this case, so we will exit early.
+                (tx_data, tx_metrics, read_tx)
+            } else {
+                unreachable!("failed reducer status should have returned early")
+            };
 
-                let event = Arc::new(event);
-                let tx_offset = Self::rollback_mut_tx(stdb, tx);
-                if let Some(client) = caller {
-                    match client.config.version {
-                        WsVersion::V1 => {
-                            let message = TransactionUpdateMessage {
-                                event: Some(event.clone()),
-                                database_update: SubscriptionUpdateMessage::default_for_protocol(
-                                    client.config.protocol,
-                                    None,
-                                ),
-                            };
+            let tx_offset = read_tx.tx_offset().into_inner();
+            let (read_tx, _) = self.guard_tx(read_tx, GuardTxOptions::from_mut(tx_data, tx_metrics_mut));
 
-                            let _ = self.broadcast_queue.send_client_message_v1(
-                                client,
-                                Some(from_tx_offset(tx_offset)),
-                                message,
-                            );
-                        }
-                        WsVersion::V2 => {
-                            if let Some(request_id) = event.request_id {
-                                self.send_reducer_failure_result_v2(client, &event, request_id);
-                            }
-                        }
-                    }
-                } else {
-                    log::trace!("Reducer failed but there is no client to send the failure to!")
-                }
-                return Ok(Ok(CommitAndBroadcastEventSuccess {
-                    tx_offset: from_tx_offset(tx_offset),
-                    event,
-                    metrics: ExecutionMetrics::default(),
-                }));
+            let event = Arc::new(event);
+            if let Some(client) = caller {
+                self.send_reducer_success_without_subscriptions(client, &event, tx_offset);
             }
+
+            drop(subscriptions);
+            drop(read_tx);
+
+            return Ok(Ok(CommitAndBroadcastEventSuccess {
+                tx_offset: from_tx_offset(tx_offset),
+                event,
+                metrics: ExecutionMetrics::default(),
+            }));
+        }
+
+        // Downgrade mutable tx.
+        // We'll later ensure tx is released/cleaned up once out of scope.
+        let (read_tx, tx_data, tx_metrics_mut) = if let EventStatus::Committed(db_update) = &mut event.status {
+            let (tx_data, tx_metrics, read_tx) = stdb.commit_tx_downgrade(tx, Workload::Update);
+            *db_update = DatabaseUpdate::from_writes(&tx_data);
+            (read_tx, tx_data, tx_metrics)
+        } else {
+            unreachable!("failed reducer status should have returned early")
         };
         let event = Arc::new(event);
 
@@ -2529,6 +2603,92 @@ mod tests {
             [product![7_u8]],
         )
         .await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn caller_without_subscriptions_gets_v1_tx_update() -> anyhow::Result<()> {
+        let db = relational_db()?;
+        let subs = ModuleSubscriptions::for_test_enclosing_runtime(db.clone());
+
+        let client_id = client_id_from_u8(1);
+        let (sender, mut rx) = client_connection(client_id, &db);
+
+        let table_id = db.create_table_for_test("t", &[("x", AlgebraicType::U8)], &[])?;
+        let mut tx = begin_mut_tx(&db);
+        db.insert(&mut tx, table_id, &bsatn::to_vec(&product![1_u8])?)?;
+
+        let mut event = module_event();
+        event.request_id = Some(7);
+
+        assert!(matches!(
+            subs.commit_and_broadcast_event(Some(sender), event, tx),
+            Ok(Ok(_))
+        ));
+
+        match rx.recv().await {
+            Some(OutboundMessage::V1(SerializableMessage::TxUpdate(TransactionUpdateMessage {
+                event: Some(event),
+                database_update:
+                    SubscriptionUpdateMessage {
+                        database_update: ws_v1::FormatSwitch::Bsatn(ws_v1::DatabaseUpdate { tables }),
+                        request_id,
+                        ..
+                    },
+            }))) => {
+                assert_eq!(request_id, Some(7));
+                assert!(tables.is_empty());
+                assert_eq!(event.request_id, Some(7));
+                assert_eq!(event.status.database_update().unwrap().tables.len(), 1);
+            }
+            other => panic!("expected v1 tx update for caller, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn caller_without_subscriptions_gets_v2_reducer_result() -> anyhow::Result<()> {
+        let db = relational_db()?;
+        let subs = ModuleSubscriptions::for_test_enclosing_runtime(db.clone());
+
+        let client_id = client_id_from_u8(1);
+        let (sender, mut rx) = client_connection_with_config(
+            client_id,
+            &db,
+            ClientConfig {
+                protocol: Protocol::Binary,
+                version: WsVersion::V2,
+                compression: ws_v1::Compression::None,
+                tx_update_full: true,
+                confirmed_reads: false,
+            },
+        );
+
+        let table_id = db.create_table_for_test("t", &[("x", AlgebraicType::U8)], &[])?;
+        let mut tx = begin_mut_tx(&db);
+        db.insert(&mut tx, table_id, &bsatn::to_vec(&product![1_u8])?)?;
+
+        let mut event = module_event();
+        event.request_id = Some(11);
+
+        assert!(matches!(
+            subs.commit_and_broadcast_event(Some(sender), event, tx),
+            Ok(Ok(_))
+        ));
+
+        match rx.recv().await {
+            Some(OutboundMessage::V2(ws_v2::ServerMessage::ReducerResult(ws_v2::ReducerResult {
+                request_id,
+                result: ws_v2::ReducerOutcome::Ok(ok),
+                ..
+            }))) => {
+                assert_eq!(request_id, 11);
+                assert!(ok.transaction_update.query_sets.is_empty());
+            }
+            other => panic!("expected v2 reducer result for caller, got {other:?}"),
+        }
 
         Ok(())
     }

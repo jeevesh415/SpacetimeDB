@@ -43,7 +43,6 @@ use spacetimedb_client_api_messages::energy::FunctionBudget;
 use spacetimedb_client_api_messages::websocket::common::{ByteListLen as _, RowListLen as _};
 use spacetimedb_client_api_messages::websocket::v1::{self as ws_v1};
 use spacetimedb_client_api_messages::websocket::v2::{self as ws_v2};
-use spacetimedb_metrics::metrics_enabled;
 use spacetimedb_data_structures::error_stream::ErrorStream;
 use spacetimedb_data_structures::map::{HashCollectionExt as _, HashSet};
 use spacetimedb_datastore::error::DatastoreError;
@@ -57,6 +56,7 @@ use spacetimedb_lib::db::raw_def::v9::Lifecycle;
 use spacetimedb_lib::identity::{AuthCtx, RequestId};
 use spacetimedb_lib::metrics::ExecutionMetrics;
 use spacetimedb_lib::{ConnectionId, Timestamp};
+use spacetimedb_metrics::metrics_enabled;
 use spacetimedb_primitives::{ArgId, ProcedureId, TableId, ViewFnPtr, ViewId};
 use spacetimedb_query::compile_subscription;
 use spacetimedb_sats::raw_identifier::RawIdentifier;
@@ -73,7 +73,7 @@ use std::fmt;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{oneshot, Semaphore};
 
 #[derive(Debug, Default, Clone, From)]
 pub struct DatabaseUpdate {
@@ -858,9 +858,7 @@ fn max_module_instances() -> Option<usize> {
             Ok(0) => None,
             Ok(limit) => Some(limit),
             Err(_) => {
-                log::warn!(
-                    "invalid SPACETIMEDB_MAX_MODULE_INSTANCES={value:?}; expected a positive integer or 0"
-                );
+                log::warn!("invalid SPACETIMEDB_MAX_MODULE_INSTANCES={value:?}; expected a positive integer or 0");
                 None
             }
         },
@@ -1178,16 +1176,19 @@ impl ModuleHost {
             (None, None)
         };
         // Ensure that we always decrement the gauge.
-        scopeguard::guard((queue_length_gauge, queue_timer), |(queue_length_gauge, queue_timer)| {
-            // Decrement the queue length gauge when we're done.
-            // This is done in a defer so that it happens even if the reducer call panics.
-            if let Some(queue_length_gauge) = queue_length_gauge {
-                queue_length_gauge.dec();
-            }
-            if let Some(queue_timer) = queue_timer {
-                queue_timer.stop_and_record();
-            }
-        })
+        scopeguard::guard(
+            (queue_length_gauge, queue_timer),
+            |(queue_length_gauge, queue_timer)| {
+                // Decrement the queue length gauge when we're done.
+                // This is done in a defer so that it happens even if the reducer call panics.
+                if let Some(queue_length_gauge) = queue_length_gauge {
+                    queue_length_gauge.dec();
+                }
+                if let Some(queue_timer) = queue_timer {
+                    queue_timer.stop_and_record();
+                }
+            },
+        )
     }
 
     /// Run a function for this module which has access to the module instance.

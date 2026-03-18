@@ -44,9 +44,7 @@ impl ThreadQos {
             Ok(value) => match ThreadQos::parse(&value) {
                 Ok(qos) => qos,
                 Err(()) => {
-                    log::warn!(
-                        "unrecognized SPACETIMEDB_THREAD_QOS={value:?}; defaulting to user-initiated on macOS"
-                    );
+                    log::warn!("unrecognized SPACETIMEDB_THREAD_QOS={value:?}; defaulting to user-initiated on macOS");
                     Some(ThreadQos::UserInitiated)
                 }
             },

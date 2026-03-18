@@ -867,8 +867,8 @@ impl InstanceCommon {
         let reducer_def = info.module_def.reducer_by_id(reducer_id);
         let reducer_name = &reducer_def.name;
 
-        let _outer_span =
-            metrics_enabled().then(|| start_call_function_span(reducer_name, &caller_identity, caller_connection_id_opt));
+        let _outer_span = metrics_enabled()
+            .then(|| start_call_function_span(reducer_name, &caller_identity, caller_connection_id_opt));
 
         let op = ReducerOp {
             id: reducer_id,
