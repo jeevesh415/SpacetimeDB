@@ -71,9 +71,9 @@ use spacetimedb_vm::relation::RelValue;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 
 #[derive(Debug, Default, Clone, From)]
 pub struct DatabaseUpdate {
@@ -753,6 +753,7 @@ impl CallProcedureParams {
 /// and multiple procedures can run concurrently with up to one reducer.
 struct ModuleInstanceManager<M: GenericModule> {
     instances: Mutex<VecDeque<M::Instance>>,
+    instance_limit: Option<Arc<Semaphore>>,
     module: M,
     create_instance_time_metric: CreateInstanceTimeMetric,
 }
@@ -802,12 +803,23 @@ impl<M: GenericModule> ModuleInstanceManager<M> {
 
         Self {
             instances: Mutex::new(instances),
+            instance_limit: max_module_instances().map(|limit| Arc::new(Semaphore::new(limit))),
             module,
             create_instance_time_metric,
         }
     }
 
     async fn with_instance<R>(&self, f: impl AsyncFnOnce(M::Instance) -> (R, M::Instance)) -> R {
+        let _permit = match &self.instance_limit {
+            Some(limit) => Some(
+                limit
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("module instance semaphore should not be closed"),
+            ),
+            None => None,
+        };
         let inst = self.get_instance().await;
         let (res, inst) = f(inst).await;
         self.return_instance(inst).await;
@@ -837,6 +849,23 @@ impl<M: GenericModule> ModuleInstanceManager<M> {
 
         self.instances.lock().await.push_front(inst);
     }
+}
+
+fn max_module_instances() -> Option<usize> {
+    static MAX_MODULE_INSTANCES: OnceLock<Option<usize>> = OnceLock::new();
+    *MAX_MODULE_INSTANCES.get_or_init(|| match std::env::var("SPACETIMEDB_MAX_MODULE_INSTANCES") {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(limit) => Some(limit),
+            Err(_) => {
+                log::warn!(
+                    "invalid SPACETIMEDB_MAX_MODULE_INSTANCES={value:?}; expected a positive integer or 0"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    })
 }
 
 #[derive(Clone)]
