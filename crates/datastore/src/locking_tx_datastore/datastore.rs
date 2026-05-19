@@ -3,7 +3,7 @@ use super::{
     tx_state::TxState,
 };
 use crate::execution_context::{Workload, WorkloadType};
-use crate::locking_tx_datastore::replay::{ErrorBehavior, Replay};
+use crate::locking_tx_datastore::replay::{build_sequence_state, ErrorBehavior, Replay};
 use crate::{
     db_metrics::DB_METRICS,
     error::{DatastoreError, TableError},
@@ -24,22 +24,21 @@ use crate::{
     },
 };
 use anyhow::anyhow;
-use core::{cell::RefCell, ops::RangeBounds};
+use core::ops::RangeBounds;
 use parking_lot::{Mutex, RwLock};
 use spacetimedb_data_structures::map::{HashCollectionExt, HashMap};
 use spacetimedb_durability::TxOffset;
 use spacetimedb_lib::{db::auth::StAccess, metrics::ExecutionMetrics};
 use spacetimedb_lib::{ConnectionId, Identity};
-use spacetimedb_paths::server::SnapshotDirPath;
 use spacetimedb_primitives::{ColId, ColList, ConstraintId, IndexId, SequenceId, TableId, ViewId};
 use spacetimedb_sats::memory_usage::MemoryUsage;
-use spacetimedb_sats::{bsatn, AlgebraicValue, ProductValue};
+use spacetimedb_sats::{AlgebraicValue, ProductValue};
 use spacetimedb_schema::table_name::TableName;
 use spacetimedb_schema::{
     reducer_name::ReducerName,
     schema::{ColumnSchema, IndexSchema, SequenceSchema, TableSchema},
 };
-use spacetimedb_snapshot::{ReconstructedSnapshot, SnapshotRepository};
+use spacetimedb_snapshot::{BoxedPendingSnapshot, DynSnapshotRepo, ReconstructedSnapshot};
 use spacetimedb_table::{
     indexes::RowPointer,
     page_pool::PagePool,
@@ -48,7 +47,6 @@ use spacetimedb_table::{
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, DatastoreError>;
 
@@ -69,7 +67,7 @@ pub struct Locking {
     // made private again.
     pub committed_state: Arc<RwLock<CommittedState>>,
     /// The state of sequence generation in this database.
-    sequence_state: Arc<Mutex<SequencesState>>,
+    pub(super) sequence_state: Arc<Mutex<SequencesState>>,
     /// The identity of this database.
     pub(crate) database_identity: Identity,
 }
@@ -118,11 +116,7 @@ impl Locking {
         commit_state.bootstrap_system_tables(database_identity)?;
         // The database tables are now initialized with the correct data.
         // Now we have to build our in memory structures.
-        {
-            let sequence_state = commit_state.build_sequence_state()?;
-            // Reset our sequence state so that they start in the right places.
-            *datastore.sequence_state.lock() = sequence_state;
-        }
+        build_sequence_state(&datastore, &mut commit_state)?;
 
         // We don't want to build indexes here; we'll build those later,
         // in `rebuild_state_after_replay`.
@@ -133,51 +127,15 @@ impl Locking {
         Ok(datastore)
     }
 
-    /// The purpose of this is to rebuild the state of the datastore
-    /// after having inserted all of rows from the message log.
-    /// This is necessary because, for example, inserting a row into `st_table`
-    /// is not equivalent to calling `create_table`.
-    /// There may eventually be better way to do this, but this will have to do for now.
-    pub fn rebuild_state_after_replay(&self) -> Result<()> {
-        let mut committed_state = self.committed_state.write_arc();
-
-        // Prior versions of `RelationalDb::migrate_system_tables` (defined in the `core` crate)
-        // initialized newly-created system sequences to `allocation: 4097`,
-        // while `committed_state::bootstrap_system_tables` sets `allocation: 4096`.
-        // This affected the system table migration which added
-        // `st_view_view_id_seq` and `st_view_arg_id_seq`.
-        // As a result, when replaying these databases' commitlogs without a snapshot,
-        // we will end up with two rows in `st_sequence` for each of these sequences,
-        // resulting in a unique constraint violation in `CommittedState::build_indexes`.
-        // We fix this by, for each system sequence, deleting all but the row with the highest allocation.
-        committed_state.fixup_delete_duplicate_system_sequence_rows();
-
-        // `build_missing_tables` must be called before indexes.
-        // Honestly this should maybe just be one big procedure.
-        // See John Carmack's philosophy on this.
-        committed_state.reschema_tables()?;
-        committed_state.build_missing_tables()?;
-        committed_state.build_indexes()?;
-        // Figure out where to pick up for each sequence.
-        *self.sequence_state.lock() = committed_state.build_sequence_state()?;
-
-        committed_state.collect_ephemeral_tables()?;
-        Ok(())
-    }
-
     /// Obtain a [`spacetimedb_commitlog::Decoder`] suitable for replaying a
     /// [`spacetimedb_durability::History`] onto the currently committed state.
     ///
     /// The provided closure will be called for each transaction found in the
     /// history, the parameter is the transaction's offset. The closure is called
     /// _before_ the transaction is applied to the database state.
-    pub fn replay<F: FnMut(u64)>(&self, progress: F, error_behavior: ErrorBehavior) -> Replay<F> {
-        Replay {
-            database_identity: self.database_identity,
-            committed_state: self.committed_state.clone(),
-            progress: RefCell::new(progress),
-            error_behavior,
-        }
+    pub fn replay<F: FnMut(u64)>(&self, progress: F, error_behavior: ErrorBehavior) -> Replay<'_, F> {
+        let committed_state = self.committed_state.write();
+        Replay::new(self.database_identity, committed_state, progress, error_behavior)
     }
 
     /// Construct a new [`Locking`] datastore containing the state stored in `snapshot`.
@@ -247,11 +205,7 @@ impl Locking {
         // Set the sequence state. In practice we will end up doing this again after replaying
         // the commit log, but we do it here too just to avoid having an incorrectly restored
         // snapshot.
-        {
-            let sequence_state = committed_state.build_sequence_state()?;
-            // Reset our sequence state so that they start in the right places.
-            *datastore.sequence_state.lock() = sequence_state;
-        }
+        build_sequence_state(&datastore, &mut committed_state)?;
 
         // The next TX offset after restoring from a snapshot is one greater than the snapshotted offset.
         committed_state.next_tx_offset = tx_offset + 1;
@@ -268,13 +222,15 @@ impl Locking {
     ///   (i.e. no transactions have been committed yet)
     ///   and therefore no snapshot was created
     ///
-    /// - or `Some` path to the newly created snapshot directory
+    /// - or `Some` transaction offset for the newly created snapshot
     ///
-    /// Returns an error if [`SnapshotRepository::create_snapshot`] returns an
+    /// Returns an error if [`DynSnapshotRepo::create_snapshot`] returns an
     /// error.
-    pub fn take_snapshot(&self, repo: &SnapshotRepository) -> Result<Option<SnapshotDirPath>> {
-        let maybe_offset_and_path = Self::take_snapshot_internal(&self.committed_state, repo)?;
-        Ok(maybe_offset_and_path.map(|(_, path)| path))
+    pub fn take_snapshot(&self, repo: &DynSnapshotRepo) -> Result<Option<TxOffset>> {
+        Self::take_snapshot_internal(&self.committed_state, repo)?
+            .map(|(_offset, snap)| snap.sync_all())
+            .transpose()
+            .map_err(Into::into)
     }
 
     pub fn assert_system_tables_match(&self) -> Result<()> {
@@ -284,8 +240,8 @@ impl Locking {
 
     pub fn take_snapshot_internal(
         committed_state: &RwLock<CommittedState>,
-        repo: &SnapshotRepository,
-    ) -> Result<Option<(TxOffset, SnapshotDirPath)>> {
+        repo: &DynSnapshotRepo,
+    ) -> Result<Option<(TxOffset, BoxedPendingSnapshot)>> {
         let mut committed_state = committed_state.write();
         let Some(tx_offset) = committed_state.next_tx_offset.checked_sub(1) else {
             return Ok(None);
@@ -297,10 +253,10 @@ impl Locking {
             tx_offset,
         );
 
-        let (tables, blob_store) = committed_state.persistent_tables_and_blob_store();
-        let snapshot_dir = repo.create_snapshot(tables, blob_store, tx_offset)?;
+        let (mut tables, blob_store) = committed_state.persistent_tables_and_blob_store();
+        let unflushed_snapshot = repo.create_snapshot(&mut tables, blob_store, tx_offset)?;
 
-        Ok(Some((tx_offset, snapshot_dir)))
+        Ok(Some((tx_offset, unflushed_snapshot)))
     }
 
     /// Returns a list over all the currently connected clients,
@@ -967,6 +923,29 @@ impl MutTx for Locking {
 }
 
 impl Locking {
+    #[cfg(any(feature = "test", test))]
+    pub fn try_begin_mut_tx(&self, _isolation_level: IsolationLevel, workload: Workload) -> Option<MutTxId> {
+        let metrics = ExecutionMetrics::default();
+        let ctx = ExecutionContext::with_workload(self.database_identity, workload);
+
+        let timer = Instant::now();
+        let committed_state_write_lock = self.committed_state.try_write_arc()?;
+        let sequence_state_lock = self.sequence_state.try_lock_arc()?;
+        let lock_wait_time = timer.elapsed();
+
+        Some(MutTxId {
+            committed_state_write_lock,
+            sequence_state_lock,
+            tx_state: TxState::default(),
+            lock_wait_time,
+            read_sets: <_>::default(),
+            timer,
+            ctx,
+            metrics,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
     pub fn rollback_mut_tx_downgrade(&self, tx: MutTxId, workload: Workload) -> (TxMetrics, TxId) {
         tx.rollback_downgrade(workload)
     }
@@ -999,18 +978,6 @@ impl Locking {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum ReplayError {
-    #[error("Expected tx offset {expected}, encountered {encountered}")]
-    InvalidOffset { expected: u64, encountered: u64 },
-    #[error(transparent)]
-    Decode(#[from] bsatn::DecodeError),
-    #[error(transparent)]
-    Db(#[from] DatastoreError),
-    #[error(transparent)]
-    Any(#[from] anyhow::Error),
-}
-
 /// Construct a [`Metadata`] from the given [`RowRef`],
 /// reading only the columns necessary to construct the value.
 fn metadata_from_row(row: RowRef<'_>) -> Result<Metadata> {
@@ -1041,7 +1008,6 @@ pub(crate) mod tests {
     };
     use crate::traits::{IsolationLevel, MutTx};
     use crate::Result;
-    use bsatn::to_vec;
     use core::{fmt, mem};
     use itertools::Itertools;
     use pretty_assertions::{assert_eq, assert_matches};
@@ -1053,7 +1019,7 @@ pub(crate) mod tests {
     use spacetimedb_lib::{resolved_type_via_v9, ScheduleAt, TimeDuration};
     use spacetimedb_primitives::{col_list, ArgId, ColId, ScheduleId, ViewId};
     use spacetimedb_sats::algebraic_value::ser::value_serialize;
-    use spacetimedb_sats::bsatn::ToBsatn;
+    use spacetimedb_sats::bsatn::{to_vec, ToBsatn};
     use spacetimedb_sats::layout::RowTypeLayout;
     use spacetimedb_sats::raw_identifier::RawIdentifier;
     use spacetimedb_sats::{product, AlgebraicType, GroundSpacetimeType, SumTypeVariant, SumValue};
@@ -3303,7 +3269,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .indexes
                 .values()
-                .map(|i| i.key_type.clone())
+                .map(|i| i.key_type().clone())
                 .collect::<Vec<_>>()
         };
         assert_eq!(index_key_types(&tx), [AlgebraicType::U64, sum_original]);

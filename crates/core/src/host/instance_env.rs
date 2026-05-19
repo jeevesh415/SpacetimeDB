@@ -23,7 +23,7 @@ use spacetimedb_lib::{http as st_http, ConnectionId, Identity, Timestamp};
 use spacetimedb_primitives::{ColId, ColList, IndexId, TableId};
 use spacetimedb_sats::{
     bsatn::{self, ToBsatn},
-    buffer::{CountWriter, TeeWriter},
+    buffer::CountWriter,
     AlgebraicValue, ProductValue,
 };
 use spacetimedb_schema::identifier::Identifier;
@@ -343,16 +343,16 @@ impl InstanceEnv {
     fn project_cols_bsatn(buffer: &mut [u8], cols: ColList, row_ref: RowRef<'_>) -> usize {
         // We get back a col-list with the columns with generated values.
         // Write those back to `buffer` and then the encoded length to `row_len`.
-        let counter = CountWriter::default();
-        let mut writer = TeeWriter::new(counter, buffer);
-        for col in cols.iter() {
-            // Read the column value to AV and then serialize.
-            let val = row_ref
-                .read_col::<AlgebraicValue>(col)
-                .expect("reading col as AV never panics");
-            bsatn::to_writer(&mut writer, &val).unwrap();
-        }
-        writer.w1.finish()
+        let (_, count) = CountWriter::run(buffer, |writer| {
+            for col in cols.iter() {
+                // Read the column value to AV and then serialize.
+                let val = row_ref
+                    .read_col::<AlgebraicValue>(col)
+                    .expect("reading col as AV never panics");
+                bsatn::to_writer(writer, &val).unwrap();
+            }
+        });
+        count
     }
 
     pub fn insert(&self, table_id: TableId, buffer: &mut [u8]) -> Result<usize, NodesError> {
@@ -401,6 +401,14 @@ impl InstanceEnv {
         table_id: TableId,
         row_ptr: RowPointer,
     ) -> Result<(), NodesError> {
+        let function_name: Arc<str> = {
+            let table = stdb.schema_for_table_mut(tx, table_id)?;
+            let schedule = table
+                .schedule
+                .as_ref()
+                .expect("schedule_row should only be called for scheduled tables");
+            Arc::from(&schedule.function_name[..])
+        };
         let (id_column, at_column) = stdb
             .table_scheduled_id_and_at(tx, table_id)?
             .expect("schedule_row should only be called when we know its a scheduler table");
@@ -417,6 +425,7 @@ impl InstanceEnv {
                 schedule_at,
                 id_column,
                 at_column,
+                function_name,
                 self.start_time,
             )
             .map_err(NodesError::ScheduleError)?;
